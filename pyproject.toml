@@ -1,0 +1,24 @@
+[project]
+name = "confluence-markdown-roundtrip"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+  "lxml>=5.0",
+  "markdown-it-py>=3.0",
+  "mdit-py-plugins>=0.4",
+  "click>=8.1",
+]
+
+[project.scripts]
+confluence-markdown-roundtrip = "confluence_markdown_roundtrip.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+]

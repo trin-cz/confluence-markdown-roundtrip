@@ -1,0 +1,19 @@
+# Copy this file to: ~/.config/confluence-markdown-roundtrip/live-tests.toml
+# Required to run `pytest --integration`. Without it, integration tests skip.
+# The file holds tenant-specific page IDs separately from source so the repo
+# stays portable. Credentials (tenant URL + token) live in credentials.toml
+# in the same directory.
+
+# Root of the Phase 2 automated test tree. The suite walks descendants of
+# this page to discover children. The tree must already exist with these
+# titles (the suite never creates pages):
+#   <root>          title = "Automated test area"
+#   ├─ <child_a>    title = "Child Alpha"
+#   │   └─ <grandchild>  title = "Grandchild Charlie"
+#   └─ <child_b>    title = "Child Bravo"
+root_page_id = "0000000000"
+
+# Phase 1.5 reference fixture page (read-only). Used by attachment / panel
+# tests as a frozen, known-shape capture. Carries a PNG + SVG attachment
+# and the full set of macro panel types.
+reference_page_id = "0000000000"

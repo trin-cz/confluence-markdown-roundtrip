@@ -1,0 +1,15 @@
+<p>First paragraph: this prose contains <ac:inline-comment-marker ac:ref="__CM_SLOT_1__">alpha anchor phrase one</ac:inline-comment-marker> and continues afterwards.</p>
+<p>Second paragraph: this one wraps <ac:inline-comment-marker ac:ref="__CM_SLOT_2__">bravo anchor phrase two</ac:inline-comment-marker> for a second comment.</p>
+<p>Third paragraph: distinct text used by reorder tests.</p>
+<p>Fourth paragraph: more distinct text for delete/insert tests.</p>
+<h2>A heading exercised by B04</h2>
+<ul><li><p>list item one</p></li><li><p>list item two</p></li><li><p>list item three</p></li></ul>
+<ac:structured-macro ac:name="info" ac:schema-version="1"><ac:rich-text-body><p>information panel body</p></ac:rich-text-body></ac:structured-macro>
+<ac:adf-extension><ac:adf-node type="panel"><ac:adf-attribute key="panel-type">success</ac:adf-attribute><ac:adf-content><p>adf success panel body</p></ac:adf-content></ac:adf-node></ac:adf-extension>
+<ac:structured-macro ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">python</ac:parameter><ac:parameter ac:name="breakoutMode">wide</ac:parameter><ac:parameter ac:name="breakoutWidth">760</ac:parameter><ac:plain-text-body><![CDATA[def hello():
+    return "world"
+]]></ac:plain-text-body></ac:structured-macro>
+<table><tbody><tr><th><p>Velocity</p></th><th><p>Mass</p></th></tr><tr><td><p>15</p></td><td><p>5</p></td></tr></tbody></table>
+<table><tbody><tr><th><p>Status</p></th><th><p>Value</p></th></tr><tr><td><ac:structured-macro ac:name="status" ac:schema-version="1"><ac:parameter ac:name="title">DONE</ac:parameter><ac:parameter ac:name="colour">Green</ac:parameter></ac:structured-macro></td><td><p>42</p></td></tr></tbody></table>
+<ac:task-list><ac:task><ac:task-id>1</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>first task body</ac:task-body></ac:task><ac:task><ac:task-id>2</ac:task-id><ac:task-status>complete</ac:task-status><ac:task-body>second task body</ac:task-body></ac:task><ac:task><ac:task-id>3</ac:task-id><ac:task-status>incomplete</ac:task-status><ac:task-body>third task body</ac:task-body></ac:task></ac:task-list>
+<ac:structured-macro ac:name="expand" ac:schema-version="1"><ac:parameter ac:name="title">expand me</ac:parameter><ac:rich-text-body><p>expand body</p></ac:rich-text-body></ac:structured-macro>

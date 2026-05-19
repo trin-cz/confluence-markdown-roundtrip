@@ -1,0 +1,37 @@
+{
+  "_comment": "Per-page test fixture spec. Bootstrap matches each page by 'expected_title', PUTs body from 'template', and reconciles inline comments (additive only). The root page ID itself lives in ~/.config/confluence-markdown-roundtrip/live-tests.toml; child IDs are discovered from descendants.",
+  "pages": {
+    "root": {
+      "expected_title": "Automated test area",
+      "template": "template-root.xml",
+      "comments": [
+        {
+          "slot": "__CM_SLOT_1__",
+          "text_selection": "alpha anchor phrase one",
+          "body": "<p>First test inline comment (slot 1).</p>"
+        },
+        {
+          "slot": "__CM_SLOT_2__",
+          "text_selection": "bravo anchor phrase two",
+          "body": "<p>Second test inline comment (slot 2).</p>"
+        }
+      ]
+    },
+    "child_a": {
+      "expected_title": "Child Alpha",
+      "template": "template-child-a.xml",
+      "comments": []
+    },
+    "child_b": {
+      "expected_title": "Child Bravo",
+      "template": "template-child-b.xml",
+      "comments": []
+    },
+    "grandchild": {
+      "expected_title": "Grandchild Charlie",
+      "parent_logical": "child_a",
+      "template": "template-grandchild.xml",
+      "comments": []
+    }
+  }
+}

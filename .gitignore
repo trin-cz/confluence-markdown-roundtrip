@@ -1,0 +1,6 @@
+__pycache__/
+uv.lock
+.venv/
+*.egg-info/
+live-tests.toml
+credentials.toml
