@@ -10,6 +10,7 @@ See plan §"Storage -> MD mapping" for the conversion rules.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html.entities import name2codepoint
 from typing import Any
 
 from lxml import etree
@@ -150,44 +151,12 @@ def _parse_fragment(xhtml: str) -> etree._Element:
 
 def _build_html_entity_decls() -> str:
     """Build a string of `<!ENTITY name "&#N;">` declarations for the
-    common HTML named entities Confluence may emit. Only the named ones
-    matter — numeric entities (`&#8212;`) work out of the box."""
-    # Most common subset; covers ~99% of what Confluence emits.
+    HTML4 named entities Confluence may emit. Numeric entities work
+    out of the box; only named ones need DOCTYPE declarations."""
     # XML's predefined entities (amp, lt, gt, apos, quot) MUST NOT be
     # redeclared — they're built-in.
-    table = {
-        "nbsp": 160, "iexcl": 161, "cent": 162, "pound": 163, "curren": 164,
-        "yen": 165, "brvbar": 166, "sect": 167, "uml": 168, "copy": 169,
-        "ordf": 170, "laquo": 171, "not": 172, "shy": 173, "reg": 174,
-        "macr": 175, "deg": 176, "plusmn": 177, "sup2": 178, "sup3": 179,
-        "acute": 180, "micro": 181, "para": 182, "middot": 183, "cedil": 184,
-        "sup1": 185, "ordm": 186, "raquo": 187, "frac14": 188, "frac12": 189,
-        "frac34": 190, "iquest": 191, "Agrave": 192, "Aacute": 193, "Acirc": 194,
-        "Atilde": 195, "Auml": 196, "Aring": 197, "AElig": 198, "Ccedil": 199,
-        "Egrave": 200, "Eacute": 201, "Ecirc": 202, "Euml": 203, "Igrave": 204,
-        "Iacute": 205, "Icirc": 206, "Iuml": 207, "ETH": 208, "Ntilde": 209,
-        "Ograve": 210, "Oacute": 211, "Ocirc": 212, "Otilde": 213, "Ouml": 214,
-        "times": 215, "Oslash": 216, "Ugrave": 217, "Uacute": 218, "Ucirc": 219,
-        "Uuml": 220, "Yacute": 221, "THORN": 222, "szlig": 223, "agrave": 224,
-        "aacute": 225, "acirc": 226, "atilde": 227, "auml": 228, "aring": 229,
-        "aelig": 230, "ccedil": 231, "egrave": 232, "eacute": 233, "ecirc": 234,
-        "euml": 235, "igrave": 236, "iacute": 237, "icirc": 238, "iuml": 239,
-        "eth": 240, "ntilde": 241, "ograve": 242, "oacute": 243, "ocirc": 244,
-        "otilde": 245, "ouml": 246, "divide": 247, "oslash": 248, "ugrave": 249,
-        "uacute": 250, "ucirc": 251, "uuml": 252, "yacute": 253, "thorn": 254,
-        "yuml": 255, "OElig": 338, "oelig": 339, "Scaron": 352, "scaron": 353,
-        "Yuml": 376, "fnof": 402, "circ": 710, "tilde": 732,
-        "ensp": 8194, "emsp": 8195, "thinsp": 8201, "zwnj": 8204, "zwj": 8205,
-        "lrm": 8206, "rlm": 8207, "ndash": 8211, "mdash": 8212, "lsquo": 8216,
-        "rsquo": 8217, "sbquo": 8218, "ldquo": 8220, "rdquo": 8221, "bdquo": 8222,
-        "dagger": 8224, "Dagger": 8225, "bull": 8226, "hellip": 8230,
-        "permil": 8240, "prime": 8242, "Prime": 8243, "lsaquo": 8249,
-        "rsaquo": 8250, "oline": 8254, "frasl": 8260, "euro": 8364,
-        "trade": 8482, "larr": 8592, "uarr": 8593, "rarr": 8594, "darr": 8595,
-        "harr": 8596, "crarr": 8629, "lceil": 8968, "rceil": 8969,
-        "lfloor": 8970, "rfloor": 8971, "loz": 9674, "spades": 9824,
-        "clubs": 9827, "hearts": 9829, "diams": 9830,
-    }
+    _XML_BUILTINS = {"amp", "lt", "gt", "apos", "quot"}
+    table = {n: c for n, c in name2codepoint.items() if n not in _XML_BUILTINS}
     return "".join(f'<!ENTITY {name} "&#{code};">' for name, code in table.items())
 
 

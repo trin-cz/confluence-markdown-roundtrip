@@ -222,6 +222,26 @@ class ConfluenceClient:
         )
         return Page.from_json(r.json())
 
+    # -- ancestors ----------------------------------------------------------
+
+    def list_ancestors(self, page_id: int | str) -> list[str]:
+        """Return ancestor page ids, topmost-ancestor first.
+
+        Each item in the response is `{id, type}` only (no title, no
+        parentId) — Plan §"Phase 8 — Ancestor pull" API note. Caller must
+        fetch each id with `get_page` for title + body. Empty list means
+        the page is the space homepage (verified against live tenant
+        2026-05-19).
+
+        Do NOT pass a `limit` query parameter: probe established that
+        truncated responses return the wrong end of the chain (immediate
+        parent, not topmost) and no `_links.next` is emitted for cursor
+        pagination. Take the default response and trust it fits.
+        """
+        r = self._request("GET", f"/wiki/api/v2/pages/{page_id}/ancestors")
+        results = r.json().get("results", [])
+        return [str(item["id"]) for item in results if item.get("type") == "page"]
+
     # -- descendants --------------------------------------------------------
 
     def list_descendants(self, root_page_id: int | str, *, depth: int | None = None) -> Iterator[Descendant]:

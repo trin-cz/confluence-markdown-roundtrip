@@ -2,21 +2,22 @@
 
 The on-disk layout (plan §"On-disk layout") nests pages as subdirectories:
 
-    <root-slug>/
-      index.md
+    <into-dir>/                  ← workspace root (--into); the workspace
       _meta/
-        _subtree.json     # only at the root
-        index.conf.json
-        index.md.orig
-      child-a/
+        _subtree.json            ← workspace-level manifest (Phase 8)
+      <topmost-ancestor-slug>/
         index.md
-        _meta/...
-        grandchild/
+        _meta/
+          index.conf.json
+          index.md.orig
+        <descendant-slug>/
           index.md
           _meta/...
 
 `_subtree.json` is the manifest that links page IDs to relative directory
-paths; it is the entry point for `push <dir>` and `status <dir>`.
+paths (relative to `<into-dir>`); it is the entry point for `push <dir>`
+and `status <dir>`. Phase 8 onward, the manifest lives at workspace root,
+above every page directory.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ SUBTREE_NAME = "_subtree.json"
 @dataclass
 class SubtreeEntry:
     page_id: str
-    path: str   # POSIX-style, relative to subtree root, e.g. "child-a/index.md"
+    path: str   # POSIX-style, relative to workspace root (--into), e.g. "engineering/architecture/index.md"
     parent_id: str | None
     title: str
     slug: str
@@ -48,31 +49,44 @@ class SubtreeEntry:
 
 @dataclass
 class SubtreeManifest:
-    root_page_id: str
-    space_id: str
+    """Phase 9: workspace holds a *forest* of trees, one per Confluence
+    space pulled into the workspace. `root_page_ids` lists the topmost
+    ancestor of each tree (or the requested page if no ancestors). The
+    workspace is the union of these trees; pages are arranged on disk by
+    Confluence parent-child within each tree.
+    """
+
+    root_page_ids: list[str]
     fetched_at: str
     pages: list[SubtreeEntry] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "root_page_id": self.root_page_id,
-            "space_id": self.space_id,
+            "root_page_ids": list(self.root_page_ids),
             "fetched_at": self.fetched_at,
             "pages": [e.__dict__ for e in self.pages],
         }
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "SubtreeManifest":
+        # Accept both Phase 8 (`root_page_id` singular) and Phase 9
+        # (`root_page_ids` plural) manifests. Always emit plural on write.
+        if "root_page_ids" in data:
+            roots = [str(x) for x in data["root_page_ids"]]
+        elif "root_page_id" in data:
+            roots = [str(data["root_page_id"])]
+        else:
+            raise KeyError("manifest missing root_page_ids/root_page_id")
         return cls(
-            root_page_id=str(data["root_page_id"]),
-            space_id=str(data.get("space_id", "")),
+            root_page_ids=roots,
             fetched_at=data.get("fetched_at", ""),
             pages=[SubtreeEntry(**p) for p in data.get("pages", [])],
         )
 
 
-def manifest_path_for(root_dir: Path) -> Path:
-    return root_dir / "_meta" / SUBTREE_NAME
+def manifest_path_for(workspace_dir: Path) -> Path:
+    """Workspace-level manifest path. `workspace_dir` is the `--into` directory."""
+    return workspace_dir / "_meta" / SUBTREE_NAME
 
 
 def is_subtree_root(path: Path) -> bool:
@@ -84,100 +98,221 @@ def is_subtree_root(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def pull_subtree(client: ConfluenceClient, root_page_id: int | str, into_dir: Path) -> Path:
-    """Pull a page + all descendants. Returns the root workspace directory.
+def pull_subtree(
+    client: ConfluenceClient,
+    requested_page_id: int | str,
+    into_dir: Path,
+    *,
+    with_ancestors: bool = True,
+    with_descendants: bool = True,
+) -> Path:
+    """Pull a vertical slice of Confluence into `into_dir`.
 
-    BFS the descendant list (plan §"Subtree pull"), slugifying titles with
-    collision resolution at each level. Then for every page in BFS order:
-    fetch + storage_to_md + write its workspace. Write _subtree.json last.
+    Phase 9: a workspace holds a *forest* of trees, one per Confluence
+    space pulled into it. Each pull either re-pulls an existing tree
+    (same topmost ancestor as some existing root_page_id) or **adds a
+    new tree** to the forest.
+
+    With `with_ancestors=False`, no upward walk: the requested page itself
+    is the new tree's root. With `with_descendants=False`, no downward
+    walk: only the ancestor chain + the requested page.
+
+    Returns the path to the **requested page's directory**.
+
+    After writing the new pages, every page in the workspace manifest is
+    re-fetched and re-rendered so cross-page links (Phase 7) are recomputed
+    against the now-complete `pid_to_relpath` index. Existing pages whose
+    `index.md` is dirty get a `.remote.md` sibling, same as ordinary
+    re-pull semantics.
     """
-    root_page = client.get_page(root_page_id)
+    requested_page = client.get_page(requested_page_id)
 
-    # Collect descendants (BFS via API), filter to pages only.
-    # `depth=10` is the v2 API's max; the default (omitted) only returns the
-    # first level or two. Trees deeper than 10 levels need iterative walking
-    # (Phase 7).
-    descendants = list(client.list_descendants(root_page.id, depth=10))
+    # 1. Ancestor spine.
+    ancestor_pages: list[Page] = []
+    if with_ancestors:
+        ancestor_ids = client.list_ancestors(requested_page.id)  # topmost-first
+        # Walk from immediate parent upward; stop at the first failure
+        # (perm-denied intermediate ancestor disconnects everything above).
+        collected_bottom_up: list[Page] = []
+        for aid in reversed(ancestor_ids):
+            try:
+                collected_bottom_up.append(client.get_page(aid))
+            except APIError as e:
+                print(
+                    f"warning: stopping ancestor walk at {aid}: {e.status}",
+                    file=sys.stderr,
+                )
+                break
+        ancestor_pages = list(reversed(collected_bottom_up))
 
-    # Build tree: parent_id -> list of children, ordered as returned by API.
-    children_of: dict[str, list[Page | _DescStub]] = {root_page.id: []}
-    by_id: dict[str, Page | _DescStub] = {root_page.id: root_page}
+    # 2. Descendants of the requested page (BFS, page-typed).
+    descendants = list(client.list_descendants(requested_page.id, depth=10)) if with_descendants else []
+
+    # 3. This pull's tree root: topmost ancestor (or the requested page).
+    new_tree_root = ancestor_pages[0] if ancestor_pages else requested_page
+
+    # 4. Load existing workspace state (forest of zero or more trees).
+    workspace_manifest_path = manifest_path_for(into_dir)
+    existing_manifest: SubtreeManifest | None = None
+    if workspace_manifest_path.exists():
+        existing_manifest = load_manifest(into_dir)
+
+    existing_by_pid: dict[str, SubtreeEntry] = (
+        {e.page_id: e for e in existing_manifest.pages} if existing_manifest else {}
+    )
+    existing_roots: list[str] = list(existing_manifest.root_page_ids) if existing_manifest else []
+
+    # 5. Determine the post-pull root set. If new_tree_root is already a
+    #    root, this is an additive re-pull of that tree. Otherwise we're
+    #    adding a new tree to the forest.
+    all_roots: list[str] = list(existing_roots)
+    if new_tree_root.id not in all_roots:
+        all_roots.append(new_tree_root.id)
+
+    # 6. Build the unified node map: ancestors (Page) + requested (Page)
+    #    + descendants (stubs) + existing manifest entries (stubs).
+    current_set: set[str] = {requested_page.id}
+    current_set.update(p.id for p in ancestor_pages)
+    current_set.update(d.id for d in descendants)
+
+    by_id: dict[str, Page | _DescStub] = {}
+    for p in ancestor_pages:
+        by_id[p.id] = p
+    by_id[requested_page.id] = requested_page
     for d in descendants:
-        children_of.setdefault(d.parent_id or "", []).append(_DescStub(d.id, d.title, d.parent_id))
         by_id[d.id] = _DescStub(d.id, d.title, d.parent_id)
+    for pid, entry in existing_by_pid.items():
+        if pid not in by_id:
+            by_id[pid] = _DescStub(pid, entry.title, entry.parent_id)
 
-    # BFS order from root.
-    bfs_order: list[str] = [root_page.id]
-    seen: set[str] = {root_page.id}
-    queue = [root_page.id]
-    while queue:
-        nxt = queue.pop(0)
-        for child in children_of.get(nxt, []):
-            if child.id in seen:
+    # 7. Build children_of and per-root reachability. Each root forms
+    #    its own tree; BFS from each root independently. Pages from a
+    #    given existing tree shouldn't be reparented under a different
+    #    root just because their parent_id metadata happens to chain
+    #    through one — only orphans (parent missing from the workspace)
+    #    are treated as their own root (defensive fallback).
+    children_of: dict[str, list[str]] = {}
+    for pid, node in by_id.items():
+        if pid in all_roots:
+            continue  # roots don't have parents in this walk
+        parent = node.parent_id
+        if parent is None:
+            continue  # truly parentless (space homepage); should be a root
+        children_of.setdefault(parent, []).append(pid)
+
+    bfs: list[str] = []
+    seen: set[str] = set()
+    for root_id in all_roots:
+        if root_id not in by_id:
+            # This root has no node in by_id — shouldn't happen for the
+            # new tree, but defensively skip stale roots.
+            continue
+        queue: list[str] = [root_id]
+        while queue:
+            pid = queue.pop(0)
+            if pid in seen:
                 continue
-            seen.add(child.id)
-            bfs_order.append(child.id)
-            queue.append(child.id)
+            seen.add(pid)
+            bfs.append(pid)
+            for cid in children_of.get(pid, []):
+                queue.append(cid)
 
-    # Slugify each page; resolve collisions PER PARENT (siblings share
-    # a directory, so the namespace is per-parent).
+    for pid in by_id:
+        if pid not in seen:
+            print(
+                f"warning: page {pid} ({by_id[pid].title!r}) is not reachable "
+                f"from any root in the forest — skipping",
+                file=sys.stderr,
+            )
+
+    # 8. Slug assignment. Workspace-root slugs share a namespace (the "")
+    #    parent_key bucket. Existing pages keep their slugs; new pages
+    #    slugify per-parent with collision resolution.
+    slug_of: dict[str, str] = {pid: e.slug for pid, e in existing_by_pid.items()}
     slugs_by_parent: dict[str, set[str]] = {}
-    slug_of: dict[str, str] = {}
-    for pid in bfs_order:
+    for entry in existing_by_pid.values():
+        slugs_by_parent.setdefault(entry.parent_id or "", set()).add(entry.slug)
+
+    for pid in bfs:
+        if pid in slug_of:
+            continue
         node = by_id[pid]
-        parent = node.parent_id if pid != root_page.id else None
-        taken = slugs_by_parent.setdefault(parent or "", set())
+        # Workspace roots use parent_key "" (their slugs share one namespace
+        # at the workspace top level). Non-root pages use their parent's id.
+        if pid in all_roots:
+            parent_key = ""
+        else:
+            parent_key = node.parent_id or ""
+        taken = slugs_by_parent.setdefault(parent_key, set())
         slug = S.slugify_unique(node.title, taken)
         taken.add(slug)
         slug_of[pid] = slug
 
-    # Compute relative path of each page (POSIX-style, joined with /).
-    path_of: dict[str, str] = {root_page.id: slug_of[root_page.id]}
-    for pid in bfs_order[1:]:
-        parent = by_id[pid].parent_id or root_page.id
+    # 9. Relative path per page (relative to into_dir).
+    path_of: dict[str, str] = {}
+    for pid, entry in existing_by_pid.items():
+        if entry.path.endswith("/index.md"):
+            path_of[pid] = entry.path[: -len("/index.md")]
+        elif entry.path == "index.md":
+            path_of[pid] = slug_of[pid]
+        else:
+            path_of[pid] = entry.path
+
+    for pid in bfs:
+        if pid in path_of:
+            continue
+        if pid in all_roots:
+            path_of[pid] = slug_of[pid]
+            continue
+        node = by_id[pid]
+        parent = node.parent_id
+        if parent is None or parent not in path_of:
+            continue  # orphan; already warned above
         path_of[pid] = f"{path_of[parent]}/{slug_of[pid]}"
 
-    # Fetch each page; record which ones we got. Inaccessible descendants
-    # (404 = perm-denied, archived, or stale entries) are skipped with a
-    # warning so the rest of the subtree still pulls.
+    # 10. Fetch the current pull's pages (ancestors + requested + descendants).
     fetched_pages: dict[str, Page] = {}
-    for pid in bfs_order:
-        if pid == root_page.id:
-            fetched_pages[pid] = root_page
+    for pid in bfs:
+        node = by_id[pid]
+        if isinstance(node, Page):
+            fetched_pages[pid] = node
+            continue
+        if pid not in current_set:
+            continue  # prior-pull page; will re-fetch in the refresh pass
+        try:
+            fetched_pages[pid] = client.get_page(pid)
+        except APIError as e:
+            print(
+                f"warning: skipping page {pid} ({node.title!r}): {e.status}",
+                file=sys.stderr,
+            )
+
+    # 11. Build link-rewrite indices covering EVERY page in the forest.
+    pid_to_relpath: dict[str, str] = {
+        pid: f"{path_of[pid]}/index.md" for pid in path_of
+    }
+    title_to_pid: dict[tuple[str, str], str] = {
+        ("", by_id[pid].title): pid for pid in path_of
+    }
+
+    # 12. Re-fetch every prior-pull page that's still in the manifest but
+    #     not in the current pull set. Phase 9: link refresh — cross-page
+    #     links in those pages may now resolve to newly-pulled targets, so
+    #     we re-render them with the updated pid_to_relpath. Standard
+    #     re_pull semantics: clean → overwrite, dirty → .remote.md sibling.
+    for pid in bfs:
+        if pid in fetched_pages or pid not in existing_by_pid:
             continue
         try:
             fetched_pages[pid] = client.get_page(pid)
         except APIError as e:
             print(
-                f"warning: skipping page {pid} ({by_id[pid].title!r}): {e.status}",
+                f"warning: skipping refresh of prior page {pid}: {e.status}",
                 file=sys.stderr,
             )
 
-    # Build the in-tree index AFTER we know which pages actually fetched.
-    # Links to skipped pages stay external on pull (since their pid is not
-    # in pid_to_relpath); subsequent pulls that gain access will rewrite them.
-    # path_of values are POSIX relative to into_dir; append /index.md to get
-    # a file path suitable for `posixpath.relpath`.
-    pid_to_relpath: dict[str, str] = {
-        pid: f"{path_of[pid]}/index.md" for pid in fetched_pages
-    }
-    # title_to_pid is keyed by title alone: Confluence enforces unique titles
-    # per space, and a subtree pull is always single-space (Future plans:
-    # cross-space). The resolver in storage_to_md only consults this dict
-    # when content-id is absent, so collision risk is bounded by the rare
-    # ri:content-title-only link form.
-    title_to_pid: dict[tuple[str, str], str] = {
-        ("", page.title): pid for pid, page in fetched_pages.items()
-    }
-
-    # Now write each fetched page.
-    root_workspace_dir = into_dir / slug_of[root_page.id]
-    manifest = SubtreeManifest(
-        root_page_id=root_page.id,
-        space_id=root_page.space_id,
-        fetched_at=iso_now(),
-    )
-    for pid in bfs_order:
+    # 13. Write each fetched page.
+    for pid in bfs:
         if pid not in fetched_pages:
             continue
         page = fetched_pages[pid]
@@ -224,31 +359,32 @@ def pull_subtree(client: ConfluenceClient, root_page_id: int | str, into_dir: Pa
                         file=sys.stderr,
                     )
 
-        # Paths are stored relative to the subtree root directory, not the
-        # `--into` parent. Root's path is "index.md"; children sit at
-        # "<rel-to-root>/index.md".
-        if pid == root_page.id:
-            rel_path = "index.md"
-        else:
-            rel_to_root = rel_dir[len(slug_of[root_page.id]) + 1 :]
-            rel_path = f"{rel_to_root}/index.md"
+    # 14. Write the workspace-level manifest LAST.
+    (into_dir / "_meta").mkdir(parents=True, exist_ok=True)
+    manifest = SubtreeManifest(
+        root_page_ids=all_roots,
+        fetched_at=iso_now(),
+    )
+    for pid in bfs:
+        if pid not in path_of:
+            continue
+        node = by_id[pid]
         manifest.pages.append(
             SubtreeEntry(
                 page_id=pid,
-                path=rel_path,
-                parent_id=by_id[pid].parent_id if pid != root_page.id else None,
-                title=page.title,
+                path=f"{path_of[pid]}/index.md",
+                parent_id=node.parent_id if pid not in all_roots else None,
+                title=node.title,
                 slug=slug_of[pid],
             )
         )
-
-    # Write the manifest LAST so partial pulls don't look complete.
-    (root_workspace_dir / "_meta").mkdir(parents=True, exist_ok=True)
-    manifest_path_for(root_workspace_dir).write_text(
+    workspace_manifest_path.write_text(
         json.dumps(manifest.to_json(), indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    return root_workspace_dir
+
+    # 15. Return path to the requested page's directory.
+    return into_dir / path_of[requested_page.id]
 
 
 @dataclass
@@ -263,21 +399,24 @@ class _DescStub:
 # ---------------------------------------------------------------------------
 
 
-def load_manifest(root_dir: Path) -> SubtreeManifest:
-    path = manifest_path_for(root_dir)
+def load_manifest(workspace_dir: Path) -> SubtreeManifest:
+    path = manifest_path_for(workspace_dir)
     if not path.exists():
-        raise S.meta_tampered(f"missing {path}", file=str(root_dir))
+        raise S.meta_tampered(f"missing {path}", file=str(workspace_dir))
     try:
         return SubtreeManifest.from_json(json.loads(path.read_text(encoding="utf-8")))
     except (json.JSONDecodeError, KeyError) as e:
-        raise S.meta_tampered(f"sidecar {path} not parseable: {e}", file=str(root_dir))
+        raise S.meta_tampered(f"sidecar {path} not parseable: {e}", file=str(workspace_dir))
 
 
-def page_dirs_leaf_first(root_dir: Path, manifest: SubtreeManifest) -> list[Path]:
+def page_dirs_leaf_first(workspace_dir: Path, manifest: SubtreeManifest) -> list[Path]:
     """Return page directories in leaf-first push order.
 
-    Order: child pages before their parents. Standard post-order DFS from
-    the manifest root.
+    Phase 9 (forest): for each tree in `manifest.root_page_ids`, post-order
+    DFS produces children-before-parents within that tree. Trees are
+    concatenated in declaration order (no inter-tree dependency — they're
+    independent in Confluence, so the order between them doesn't matter
+    for correctness).
     """
     by_id = {e.page_id: e for e in manifest.pages}
     children_of: dict[str | None, list[str]] = {}
@@ -285,20 +424,26 @@ def page_dirs_leaf_first(root_dir: Path, manifest: SubtreeManifest) -> list[Path
         children_of.setdefault(e.parent_id, []).append(e.page_id)
 
     order: list[str] = []
-    stack: list[tuple[str, bool]] = [(manifest.root_page_id, False)]
-    while stack:
-        pid, processed = stack.pop()
-        if processed:
-            order.append(pid)
+    seen: set[str] = set()
+    for root_id in manifest.root_page_ids:
+        if root_id not in by_id or root_id in seen:
             continue
-        stack.append((pid, True))
-        for child_id in children_of.get(pid, []):
-            stack.append((child_id, False))
+        stack: list[tuple[str, bool]] = [(root_id, False)]
+        while stack:
+            pid, processed = stack.pop()
+            if processed:
+                if pid not in seen:
+                    seen.add(pid)
+                    order.append(pid)
+                continue
+            if pid in seen:
+                continue
+            stack.append((pid, True))
+            for child_id in children_of.get(pid, []):
+                stack.append((child_id, False))
 
     out: list[Path] = []
     for pid in order:
         rel = by_id[pid].path
-        # rel is "index.md" for root or "<sub>/.../index.md" for descendants —
-        # always relative to root_dir, so this resolves cleanly.
-        out.append(root_dir / Path(rel).parent)
+        out.append(workspace_dir / Path(rel).parent)
     return out

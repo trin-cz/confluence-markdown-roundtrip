@@ -33,7 +33,7 @@ Subtree mode operates on the page itself + all descendants.
 | 11 | Re-pull | Overwrite clean, write `.remote.md` for dirty |
 | 12 | Footer/page comments | Ignored (survive on Confluence automatically) |
 | 13 | Dirty check | Two-stage: MD-hash fast path → storage-hash verifier |
-| 14 | Subtree scope | Root + all descendants; cross-tree links stay opaque |
+| 14 | Subtree scope | Phase 3: root + all descendants. Phase 8: always also the full ancestor chain up to the Space root (vertical slice). Cross-tree links stay opaque. |
 | 15 | Deliverable | SKILL.md + Python CLI |
 | 16 | Language | Python (lxml + markdown-it-py + httpx) |
 | 17 | Task lists | Text editable, state opaque: `- <!--ct:UUID--> task text` |
@@ -152,18 +152,22 @@ Page title lives in Confluence metadata, not in body. On pull, the title is synt
 
 ### Subtree `_subtree.json`
 
+Location: Phase 7 — `<into>/<root-slug>/_meta/_subtree.json` (inside the requested page's per-page `_meta/`). Phase 8 onward — `<into>/_meta/_subtree.json` (workspace-level, above every page directory).
+
 ```jsonc
 {
-  "root_page_id": "12345",
+  "root_page_id": "12345",        // single topmost page tracked in this workspace (Phase 8 = topmost ancestor; Phase 9 may turn this into root_page_ids array)
   "space_key": "DOCS",
   "fetched_at": "2026-05-15T...",
   "pages": [
-    { "page_id": "12345", "path": "index.md",                    "parent_id": null,    "title": "Root", "slug": "root" },
-    { "page_id": "12346", "path": "child-a/index.md",            "parent_id": "12345", "title": "Child A", "slug": "child-a" },
+    { "page_id": "12345", "path": "index.md",                    "parent_id": null,    "title": "Root",       "slug": "root"       },
+    { "page_id": "12346", "path": "child-a/index.md",            "parent_id": "12345", "title": "Child A",    "slug": "child-a"    },
     { "page_id": "12347", "path": "child-a/grandchild/index.md", "parent_id": "12346", "title": "Grandchild", "slug": "grandchild" }
   ]
 }
 ```
+
+Phase 8 does not change the schema — it only changes what pages appear in `pages`. When ancestors are pulled, they're added top-down before the requested page. See Phase 8 for the full vertical-slice example.
 
 ## On-disk layout
 
@@ -195,15 +199,19 @@ Each page directory has exactly two visible entries: `index.md` (user-editable) 
 - `_meta/index.md.orig` — verbatim copy of `index.md` as written by `pull`. Enables local `diff index.md _meta/index.md.orig`, gives `status` a real change view, supports 3-way merge in future conflict-resolution work. Re-pull rewrites it in lockstep with `index.md`. Its sha256 must always equal `sidecar.base_md_sha256`; mismatch aborts push.
 - `_meta/index.conf.json` — per-page sidecar metadata (schema above).
 - `_meta/attachments/` — binary copies of referenced attachments. Image refs in `index.md` use the relative path `./_meta/attachments/<filename>`.
-- `_meta/_subtree.json` — present only in the root page's `_meta/` directory; describes the full tree.
+- `_meta/_subtree.json` — Phase 7: lives inside the root page's per-page `_meta/`. Phase 8 onward: lives at the workspace's top-level `_meta/` (`<into>/_meta/_subtree.json`), above every page directory. Describes the full tree either way.
 
 ## CLI surface
 
 ```
 confluence-markdown-roundtrip pull <page-url-or-id> [--subtree] [--depth N] [--into DIR]
+    --subtree pulls the page + all descendants AND (Phase 8) the full ancestor chain
+    up to the Space root. Workspace root directory = slug of the topmost ancestor;
+    the requested page is nested at its true depth. See Phase 8 for the manifest.
 confluence-markdown-roundtrip push <path>
     file → push one page
     dir  → walk _meta/_subtree.json, push every dirty page leaf-first
+            (descendants before requested page before ancestors)
 confluence-markdown-roundtrip status <path>
     file → base vs remote version, dirty bit
     dir  → table per page: dirty, remote-advanced, conflict
@@ -243,13 +251,17 @@ File permissions must be `0600` (owner-read/write only). The CLI refuses to star
 
 Walk `_meta/_subtree.json` `.pages` leaf-first (children before parents). On first failure, stop. No transactional rollback (Confluence has no multi-page transaction). Already-pushed pages stay applied; user resumes with `push` to retry remaining.
 
+Leaf-first naturally handles ancestor entries from Phase 8: descendants of the requested page push first, then the requested page, then ancestors in deepest-to-shallowest order. The `role` tag does not change ordering — `parent_id` alone determines depth.
+
 ## Subtree pull
 
-1. Resolve root page id (URL or id).
-2. Walk descendants via v2 API (`GET /pages/{id}/descendants`, paginated). BFS order.
-3. For each page: pull single-page artifacts. Slugify title; resolve collisions with `-2`, `-3` suffix recorded in `_meta/_subtree.json`. Write `index.md` then copy it byte-for-byte to `_meta/index.md.orig`. Write `_meta/index.conf.json`.
-4. Download referenced attachment images to `<page-dir>/_meta/attachments/`.
-5. Write the root page's `_meta/_subtree.json` last.
+1. Resolve requested page id (URL or id).
+2. **(Phase 8)** Walk ancestors via v2 API (`GET /pages/{id}/ancestors`, paginated). Topmost-first chain up to the Space root.
+3. Walk descendants via v2 API (`GET /pages/{id}/descendants`, paginated). BFS order.
+4. Concatenate entries top-down: ancestors → requested → descendants. Each entry stamped with `role` ∈ `"ancestor" | "requested" | "descendant"`.
+5. For each page: pull single-page artifacts. Slugify title; resolve collisions with `-2`, `-3` suffix recorded in `_meta/_subtree.json`. Write `index.md` then copy it byte-for-byte to `_meta/index.md.orig`. Write `_meta/index.conf.json`.
+6. Download referenced attachment images to `<page-dir>/_meta/attachments/`.
+7. Write `_meta/_subtree.json` last, in **the workspace's** top-level `_meta/` directory (`<into>/_meta/_subtree.json`) — one level above every page directory, including the topmost ancestor's. The CLI also prints the requested page's on-disk path to stdout so the user can navigate to it directly.
 
 Re-pull on existing directory: per-file, overwrite clean (`index.md` equals `_meta/index.md.orig`) or write `<file>.remote.md` sibling for dirty. On clean overwrite, `_meta/index.md.orig` is rewritten in lockstep with `index.md`.
 
@@ -1201,10 +1213,186 @@ Both inputs are POSIX-style paths relative to `into_dir` (the subtree root paren
 
 **Definition of done.** L1–L9 green, the Alexandria subtree pulled today renders with working cross-page links in VS Code preview (Cmd-click → opens the right local file), full round-trip canonical identity for every internal link without any user edits. **Phase 7 complete.** Implementation: [test_links.py](code/confluence_markdown_roundtrip/tests/test_links.py); helpers in [sentinels.py](code/confluence_markdown_roundtrip/sentinels.py) (`CL_RE`, `cl()`, `unknown_cl_hash`); emit in [storage_to_md.py](code/confluence_markdown_roundtrip/storage_to_md.py) (`_maybe_rewrite_a_as_cl`, `_maybe_rewrite_ac_link_as_cl`, `_emit_cl`, `_parse_tenant_page_url`); push handling in [md_to_storage.py](code/confluence_markdown_roundtrip/md_to_storage.py) (`_inline_link`, `_looks_like_local_workspace_path`); subtree index in [subtree.py](code/confluence_markdown_roundtrip/subtree.py) (two-pass: fetch then convert with `pid_to_relpath` / `title_to_pid` / `self_page_relpath`).
 
+### Phase 8 — Ancestor pull (vertical slice to Space root)
+
+Subtree pulls today produce a *downward* slice: the requested page + all descendants. A page deep in the tree pulls a small workspace; nothing tells you where it sits in the broader Space. Worse, cross-page links to *parent* pages (the common "up to overview" / "see also in parent doc" pattern) always resolve out-of-tree under Phase 7 and stay as external URLs.
+
+Phase 8 extends subtree pulls so that *every* `--subtree` pull also walks **upward** to the Space root and includes the full ancestor chain in the same workspace. The result is a vertical slice from the topmost ancestor down through the requested page and out to its descendants — one folder, one consistent workspace, no scattered ancestor pulls in sibling directories.
+
+**Always-on.** No flag. Every `--subtree` pull walks ancestors. The user explicitly asked for this to be unconditional: scattered workspaces of partial trees defeat the point. Single-page pulls (no `--subtree`) are unchanged — they remain a one-page workspace with no surrounding context.
+
+**Workspace identity shifts to `--into`.** Pre-Phase-8 the workspace root directory was the slug of the requested page; the manifest lived inside that page's `_meta/`. Post-Phase-8 the workspace **is** the `--into` directory itself. The manifest lives at `<into>/_meta/_subtree.json` — one level *above* every page directory, including the topmost ancestor's. Each page in the workspace (including the topmost ancestor) still has its own per-page `_meta/` for sidecar + orig + attachments; the workspace-level `_meta/` only holds the shared manifest.
+
+This shift unlocks a future-plan: a single workspace can hold multiple top-ancestor trees (multi-space pulls — see "Phase 9 prerequisite" below). Phase 8 itself **constrains the manifest to exactly one root tree** (single space, single topmost ancestor), but the layout is the same one a multi-root workspace would use. The cost of moving the manifest now vs retrofitting later is asymmetric — cheap to do during Phase 8, expensive to migrate workspaces afterward.
+
+Example. User runs `pull --subtree <id-of-Backend> --into ./work` where the Confluence tree is:
+
+```
+Engineering (space-home)
+└── Architecture
+    └── Backend            ← requested
+        ├── Auth
+        └── Storage
+            └── S3
+```
+
+Resulting workspace:
+
+```
+work/                               ← --into; workspace identity lives here
+  _meta/
+    _subtree.json                   ← workspace-level manifest (Phase 8 location)
+  engineering/                      ← topmost ancestor of the only tree in this workspace
+    index.md
+    _meta/                          ← per-page sidecar (unchanged)
+      index.md.orig
+      index.conf.json
+    architecture/
+      index.md
+      _meta/...
+      backend/                      ← the requested page
+        index.md
+        _meta/...
+        auth/
+          index.md
+          _meta/...
+        storage/
+          index.md
+          _meta/...
+          s3/
+            index.md
+            _meta/...
+```
+
+The user's mental model is "I pulled Backend"; the disk layout is "the workspace at `./work/` contains the vertical slice that *contains* Backend." To bridge the gap, the CLI prints the requested page's on-disk path to stdout immediately after pull. `status ./work/` and `push ./work/` operate on the whole workspace via the workspace-level manifest — no need to type the topmost-ancestor slug.
+
+**Phase 9 prerequisite (deferred — not in scope for Phase 8).** The workspace-level manifest could in principle hold pages from multiple top-ancestor trees (e.g. one pulled from Space EN, another from Space MKT). Phase 9 — cross-space link resolution — would relax the single-tree constraint by allowing additional `pull --subtree` invocations into the same `--into` to add new top-ancestor trees to the manifest. Phase 8 enforces "one tree per workspace": a `pull --subtree` into a workspace that already contains pages from a different space's tree aborts with the same slug-collision rule that catches same-space slug clashes. Schema is forward-compatible (see manifest shape below); behavior is not.
+
+**API.** Confluence v2 returns the ancestor chain via `GET /wiki/api/v2/pages/{id}/ancestors` (lives in its own `api-group-ancestors`, not under `api-group-page`). Verified against the live tenant 2026-05-19:
+
+- **Response items are minimal:** each result is `{id, type}` only — no `title`, no `parentId`, no `body`. Asymmetric vs `/descendants`, which returns `{id, status, title, parentId, depth, childPosition, type}`. To get title (for slug) and storage body (for content), call `GET /pages/{id}?body-format=storage` once per ancestor. Total ancestor fetches = 1 list call + N body fetches.
+- **Ordering, full response:** topmost ancestor first, immediate parent last. (Confirmed: grandchild's 4-ancestor chain returned topmost-first.)
+- **Ordering, with `limit < chain_depth`:** returns the *immediate parent* end of the chain, not the topmost end — contradicting the "topmost first" doc claim. **Do not pass `limit` on this endpoint.** Take the default response and assume the chain fits. Confluence's practical chain depths are well below any reasonable hard cap.
+- **No pagination.** No `_links.next` was returned in any probe, including the deliberately-truncated `limit=1` case where pagination should appear if it existed. Treat the endpoint as single-shot.
+- **The ancestors endpoint does not transitively return descendants** — we still call `/descendants` on the requested page, not on the topmost ancestor. Ancestor sibling pages (other children of any ancestor) are not pulled; only the linear chain.
+
+**Manifest schema additions** (`_meta/_subtree.json`):
+
+```jsonc
+{
+  "root_page_id": "<topmost-ancestor-id>",   // workspace identity = topmost page on disk
+  "space_key":    "EN",
+  "fetched_at":   "...",
+  "pages": [
+    { "page_id": "1", "path": "index.md",                                "parent_id": null, "title": "Engineering",  "slug": "engineering"  },
+    { "page_id": "2", "path": "architecture/index.md",                   "parent_id": "1",  "title": "Architecture", "slug": "architecture" },
+    { "page_id": "3", "path": "architecture/backend/index.md",           "parent_id": "2",  "title": "Backend",      "slug": "backend"      },
+    { "page_id": "4", "path": "architecture/backend/auth/index.md",      "parent_id": "3",  "title": "Auth",         "slug": "auth"         },
+    { "page_id": "5", "path": "architecture/backend/storage/index.md",   "parent_id": "3",  "title": "Storage",      "slug": "storage"      },
+    { "page_id": "6", "path": "architecture/backend/storage/s3/index.md","parent_id": "5",  "title": "S3",           "slug": "s3"           }
+  ]
+}
+```
+
+Schema is **identical** to pre-Phase-8 — same fields, just more entries when ancestors are pulled. No new keys, no `role`, no `requested_page_id`. The workspace is identified by `root_page_id` alone; "which page the user asked for" is not persisted because the workspace can accumulate multiple pull-focuses over time (see "Re-pull semantics" below). Post-pull stdout uses the CLI arg directly — no manifest lookup of a "requested" page needed.
+
+**Forward-compatibility note (Phase 9 prerequisite).** `root_page_id` is a single string in Phase 8. The Phase 9 design (multi-space workspaces) would replace it with `root_page_ids: ["..."]` (array). Phase 8 readers must accept the array form by treating it as a single-element list, OR Phase 9 will introduce a one-shot schema migration; this is the only forward-compat hook the schema reserves. Manifest location (`<into>/_meta/_subtree.json`) does not move between Phase 8 and Phase 9.
+
+**Re-pull semantics: additive union.** Pulling a second page into an existing workspace (same topmost ancestor, so the new pull's slugified root matches the existing workspace directory) **adds** new pages to the manifest and refreshes existing ones via the standard `.remote.md`-for-dirty / overwrite-for-clean policy. It never removes pages. Stale pages from a prior pull (descendants of the *previous* requested page that aren't in the *current* pull's set) stay on disk. Users who want a clean slate `rm -rf` and re-pull.
+
+**Per-page sidecars (`_meta/index.conf.json`).** Unchanged. Ancestor pages get the same sidecar as every other page — `parent_id` already points to whoever the Confluence parent is, which is now also represented on disk.
+
+**Pull algorithm** (subtree.py):
+
+```
+def pull_subtree(requested_id, into_dir):
+    # 1. Ancestor spine — id-only list, then N body fetches for title + storage
+    ancestor_ids = client.list_ancestors(requested_id)        # topmost-first; may be empty; no pagination
+    ancestor_pages = [client.get_page(aid) for aid in ancestor_ids]   # N+1 fetches; see "API" above
+
+    # 2. Descendant tree — rich list response (title + parentId in one call), still per-page body fetches
+    descendants = client.list_descendants(requested_id)       # BFS, page-typed only
+
+    # 3. Build manifest entries top-down (no role label — schema is topology-only)
+    entries  = [_entry(p) for p in ancestor_pages]
+    entries += [_entry(requested)]
+    entries += [_entry(p) for p in descendants]
+
+    _assign_paths_and_slugs(entries)   # parent_id walk → relative path, slug-collision pass
+
+    for entry in entries:
+        _pull_one_page(entry, into_dir)
+
+    _write_subtree_manifest(into_dir / "_meta" / "_subtree.json", entries)
+```
+
+Each ancestor incurs one extra `GET /pages/{id}` because the list endpoint returns only `{id, type}` per item. No version-skip / cache optimization in Phase 8 — re-pulling a workspace re-fetches every ancestor body even if unchanged. ("First make it work, optimize later" — explicit user call; see future-plans entry on incremental re-pull.)
+
+`_assign_paths_and_slugs` already exists for descendants. Extending it to handle ancestors is just feeding the ancestor entries into the same parent-id walk first; collisions resolved with the same `-2`, `-3` scheme. Slug for the topmost ancestor becomes the workspace root directory name.
+
+**Push.** Leaf-first ordering already in place. Ancestors are higher in the tree than the requested page, so they push *after* the requested page and its descendants. No code change to push order — it falls out of the parent-id walk.
+
+**Cross-page link rewriting (Phase 7) interaction.** This is the headline benefit. The Phase 7 `pid_to_relpath` index covers every page in `_subtree.json` — ancestors included. So a link from `Backend` → `Engineering` (parent → topmost ancestor) now resolves locally:
+
+```
+[Engineering](../../index.md)<!--cl:HASH-->
+```
+
+A link from `S3` → `Architecture` (deep descendant → ancestor):
+
+```
+[Architecture](../../../index.md)<!--cl:HASH-->
+```
+
+`storage_to_md` needs no change. The `pid_to_relpath` is fed the full manifest; Phase 7's resolution logic handles direction-agnostic.
+
+**Edge cases.**
+
+| Case | Behavior |
+|---|---|
+| Requested page is the Space homepage (no parent) | `list_ancestors` returns empty; the requested page is the topmost ancestor; only one page in `pages` (plus any descendants). Workspace layout: `<into>/_meta/_subtree.json` + `<into>/<homepage-slug>/index.md`. |
+| Permission denied on an ancestor | The v2 ancestors endpoint returns 200 with only the ancestors the caller can see; gaps in the chain become invisible. Pull continues; resulting workspace's topmost dir is the shallowest readable ancestor. Manifest's `parent_id` on that page may reference a Confluence id with no on-disk entry — same situation as Phase 7's out-of-tree links. Phase 7 link resolution skips the unresolvable ones (treats them as out-of-tree). No abort. |
+| Ancestor chain >10 levels deep | API caps individual descendant calls at depth 10. The ancestors endpoint imposes no depth cap and (per live probe) does not paginate at all — the full chain returns in one response with no `_links.next`. Long chains pull cleanly so long as they fit the server's default limit, which empirically holds at least 4 deep and is presumed generous. Do not pass `limit`; truncated responses return the wrong end of the chain (immediate parent, not topmost). |
+| Same title appears in ancestor and descendant chains | Slugify collision resolver assigns `-2` to whichever entry is processed second. Order is ancestors-then-requested-then-descendants, so ancestor keeps the bare slug. |
+| Repeated pull into the same `--into`, same space, overlapping vertical slice | Same workspace, same `root_page_id`. Re-pull is **additive**: new pages merge into the manifest, existing pages refresh via the standard dirty/`.remote.md` policy. The manifest accumulates pages over time; stale pages from prior focuses are not auto-removed. |
+| Re-pull of the same page after the tree was reparented in Confluence | The new ancestor chain is fetched. If the topmost-ancestor changes, the workspace's `root_page_id` would have to change — but Phase 8 enforces "one tree per workspace," so re-pull aborts with a `root_page_id` mismatch. User either re-pulls into a fresh `--into` or deletes the old workspace and starts over. |
+| Pull into `--into` that already holds a workspace from a different space | Phase 8 single-tree constraint: a workspace can hold exactly one top-ancestor tree. Re-pull verifies the workspace's existing `root_page_id` equals the new pull's topmost ancestor id; mismatch → abort with "this workspace holds a tree rooted at a different page; choose a different `--into`". (Phase 9 would relax this to allow multi-root workspaces with one shared manifest — see future-plans.) |
+| Slug collision between two top-ancestor titles | Cannot occur in Phase 8 (one tree per workspace, so one topmost ancestor, so one top-level slug). In Phase 9 it would be resolved with the standard `-2`, `-3` suffix per-parent rule applied at workspace-root level. |
+
+**Tests.**
+
+| # | Test | Capability |
+|---|---|---|
+| AN1 | `test_subtree_pull_includes_ancestors` | Pull `--subtree` on a non-root page; verify `_subtree.json` contains every ancestor up to the space homepage as well as the requested page and its descendants. `parent_id` chain in the manifest reconstructs the full Confluence hierarchy. Verify on-disk layout matches the ancestor chain depth. |
+| AN2 | `test_subtree_pull_root_page_no_ancestors` | Pull `--subtree` on the space homepage; ancestor list is empty; workspace root is the requested page (behaves like Phase 7). |
+| AN3 | `test_subtree_pull_writes_workspace_manifest` | After pull, `<into-dir>/_meta/_subtree.json` exists (at workspace root, not inside any page's `_meta/`); `root_page_id` is the topmost ancestor id; the page passed on the CLI lives at `<into-dir>/<topmost-slug>/.../<requested-slug>/index.md` discoverable by walking the manifest. |
+| AN4 | `test_subtree_push_leaf_first_includes_ancestors` | Pull `--subtree` for Child Alpha. The resulting slice contains: the space homepage, the read-only reference fixture, `Automated test area`, `Child Alpha` (requested), `Grandchild Charlie` (descendant). Edit Grandchild Charlie (descendant), Child Alpha (requested), and Automated test area (ancestor, inside test scope). Leave the reference fixture and the space homepage untouched — pulled into the workspace but never PUT to. Push the whole workspace. Verify PUT order is Grandchild Charlie → Child Alpha → Automated test area (deepest first), and no PUT was issued to the two above-scope pages. |
+| AN5 | `test_cross_page_link_to_ancestor_resolves_local` | A page in the slice contains a link to its parent (or grandparent) page; verify the link rewrites to a relative `../[...]/index.md<!--cl:HASH-->` and the target file exists on disk. |
+| AN6 | `test_ancestor_endpoint_does_not_paginate` | Live or recorded fixture: call `/ancestors` with `limit=1` against a 4+ deep chain, verify response contains only 1 item AND no `_links.next` (confirms the no-pagination contract; locks the "never pass limit" rule). |
+| AN7 | `test_pull_aborts_on_root_page_id_mismatch` | Pre-existing workspace at `./work/` with `_meta/_subtree.json.root_page_id = X`; new pull's topmost ancestor is page Y (id ≠ X). Verify the pull aborts with "workspace holds a tree rooted at a different page; choose a different `--into`" rather than overwriting the manifest. Same-tree re-pulls (different focus, same `root_page_id`) must NOT trigger this abort — additive union is the supported path. |
+| AN8 | `test_permission_denied_ancestor_skipped` | Mocked ancestors response with a gap (one ancestor missing per ACL); pull succeeds; workspace root is the shallowest readable ancestor; Phase 7 link to the invisible ancestor degrades to out-of-tree URL. Offline. |
+| AN9 | `test_alexandria_real_subtree_pulls_full_path_to_root` | Live test: pull a known mid-depth page from the Alexandria space (or test tree); verify the resulting workspace has the expected ancestor depth and the requested page sits at the expected nested path. |
+
+**Test scope constraint.** Phase 8 pulls of pages inside the Automated test area unavoidably bring in pages *above* the test area (the read-only reference fixture and the space homepage, per the live probe) because the ancestor walk doesn't stop at the test root. Those pages live outside the test-suite's "fair game" zone per CLAUDE.md. Phase 8 tests **pull them into the workspace** but **must not PUT to them** — any AN test that pushes an ancestor edit must target a page within the Automated test area subtree (e.g. Child Alpha when grandchild is the requested page, never the reference fixture or the space homepage). Restore-baseline does not touch those pages either.
+
+**Migration / backward compat.** Schema is unchanged between Phase 7 and Phase 8. Location moves: Phase 7 wrote `_subtree.json` inside the requested page's `_meta/` directory; Phase 8 writes it at workspace root (`<into>/_meta/_subtree.json`). On encountering a Phase 7 workspace (manifest at `<into>/<requested-slug>/_meta/_subtree.json`, no workspace-level `_meta/`), Phase 8 code performs a one-shot in-place move: relocate the manifest file up one level. The pre-Phase-8 layout had no workspace-level `_meta/` directory, so there's no collision. No rewrite of manifest contents needed. After migration the workspace also gets ancestor entries on the next pull, but topology is preserved across the move alone (no pull required just to migrate).
+
+**Out of scope.**
+- Pulling sibling subtrees of any ancestor (only the linear ancestor chain).
+- Creating/moving/deleting ancestor pages (structural ops remain out per plan §"Locked decisions").
+- Auto-merging when re-pull changes the workspace root directory name due to reparenting.
+- Multi-space workspaces. The manifest *location* is workspace-level (Phase 9 prerequisite); the *content* is constrained to a single tree from a single space in Phase 8. Cross-space pulls into the same `--into` abort.
+- Cross-space link rewriting. Stays in Phase 9 — see future-plans.
+- Cross-space ancestor walks (ancestor chains stop at the space; a page's "parent" never crosses spaces in Confluence).
+
+**Definition of done.** AN1–AN9 green, Phase 7 cross-page link rewriting now resolves links to ancestors locally on real subtrees, `pull --subtree <mid-depth-page>` produces a workspace rooted at the topmost readable ancestor with the requested page nested at correct depth. Documentation: SKILL.md updated to explain the workspace-root-shift to agent and user; plan §"CLI surface" updated to note the always-on ancestor walk for `--subtree`.
+
 ## Future plans (no scheduled phase)
 
 Items below are out of scope for the current roadmap. They are recorded so the design implications are visible, but no work is committed; treat any of them as a fresh planning effort if a use case forces it.
 
+- Phase 8 re-pull optimization: skip re-fetching ancestor bodies whose remote version equals the local `base_version` (cheap `GET /pages/{id}` for version metadata only, like `status` does). Currently every re-pull re-fetches the full ancestor spine.
+- Cross-space link resolution. Today (Phase 7) and through Phase 8, links to pages in *other* Confluence spaces stay as external URLs because the manifest is single-space. A future phase could: (a) detect cross-space links during pull, (b) fetch the referenced pages from their home spaces, (c) merge them into a multi-space workspace that abandons the single-`root_page_id` model. This is a substantial design lift — workspace identity becomes set-of-roots rather than one root, slug-collision rules expand to handle same-titled pages across spaces, push order needs to handle independent space trees — and it isn't requested for any current use case beyond "wouldn't it be nice." Out of scope for Phase 8.
 - ADF support.
 - OAuth 3LO.
 - Attachment upload (new images via MD).

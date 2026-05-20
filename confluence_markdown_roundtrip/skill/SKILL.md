@@ -24,14 +24,25 @@ sidecar — only do this when local editing is expected.
 ## CLI surface
 
 ```
-confluence-markdown-roundtrip pull <page-url-or-id> [--into DIR] [--subtree]
+confluence-markdown-roundtrip pull <page-url-or-id> [--into DIR] [--subtree] [--ancestors/--no-ancestors]
 confluence-markdown-roundtrip push <path>
 confluence-markdown-roundtrip status <path>
 ```
 
-- `pull` writes `<into>/<slug>/index.md` and a `_meta/` directory.
-- `push` reads the workspace and uploads. If `<path>` is a subtree root
-  (contains `_meta/_subtree.json`), every dirty page is pushed leaf-first.
+- `pull` (no flags) writes `<into>/<slug>/index.md` + per-page `_meta/`.
+  Single-page workspace, today's classic layout.
+- `pull --subtree` walks the requested page **and all descendants and all
+  ancestors up to the space homepage** (Phase 8 default). The workspace is
+  `<into>` itself; the manifest sits at `<into>/_meta/_subtree.json`; pages
+  nest by Confluence parent-child. The CLI prints the on-disk path of the
+  page you asked for so you can navigate straight to it.
+- `pull --subtree --no-ancestors` skips the upward walk — workspace is
+  rooted at the requested page (Phase 7 behavior).
+- `pull <id> --ancestors` (no `--subtree`) walks ancestors but not
+  descendants — a vertical slice without the sub-tree.
+- `push` reads the workspace and uploads. If `<path>` is a workspace root
+  (contains `_meta/_subtree.json`), every dirty page is pushed leaf-first
+  — descendants before requested before ancestors. Clean pages are skipped.
 - `status` prints a TSV row per page: `page_id title local_version remote_version dirty conflict`.
 
 Credentials live in `~/.config/confluence-markdown-roundtrip/credentials.toml`
@@ -39,22 +50,62 @@ Credentials live in `~/.config/confluence-markdown-roundtrip/credentials.toml`
 
 ## Workspace layout
 
+Single-page pull (`pull <id>`):
+
 ```
-<root-slug>/
-  index.md             ← user edits this
-  _meta/               ← tool-owned, do not touch
-    index.md.orig
-    index.conf.json
-    attachments/
-    _subtree.json      ← only at subtree roots
-  child-a/             ← only in subtrees
+<into>/
+  <slug>/
+    index.md           ← user edits this
+    _meta/             ← tool-owned, do not touch
+      index.md.orig
+      index.conf.json
+      attachments/
+```
+
+Subtree pull (`pull <id> --subtree`) — vertical slice from space homepage
+to the requested page and out to its descendants. Manifest lives at
+**workspace root**, above every page directory:
+
+```
+<into>/                    ← workspace identity = this directory
+  _meta/
+    _subtree.json          ← workspace-level manifest (forest of trees)
+  <topmost-ancestor-slug>/ ← root of tree #1
+    index.md
+    _meta/...
+    <ancestor-slug>/
+      index.md
+      _meta/...
+      <requested-slug>/    ← the page you asked for
+        index.md
+        _meta/...
+        <descendant-slug>/
+          index.md
+          _meta/...
+  <other-topmost-slug>/    ← root of tree #2 (only after a cross-space pull)
     index.md
     _meta/...
 ```
 
 `index.md` is the only file the user (or you, the agent) should edit.
-`_meta/` is tool-owned: editing anything in it will cause push to abort
-with `orig-tampered` or `meta-tampered`.
+`_meta/` (both per-page and workspace-level) is tool-owned: editing
+anything in it will cause push to abort with `orig-tampered` or
+`meta-tampered`.
+
+A workspace holds a **forest of trees** — one tree per Confluence space
+pulled into it. Pulling a page from a new space into an existing
+workspace appends its tree to the forest (the manifest's `root_page_ids`
+gains an entry). Pulling another page from the *same* tree is additive:
+new pages merge into the manifest, existing files refresh via the
+standard `.remote.md`-for-dirty policy.
+
+**Cross-page link refresh.** Every pull re-fetches every page already in
+the workspace and re-renders its Markdown using the now-complete page
+index. The effect: cross-page links that used to point out-of-workspace
+become local relative paths once their targets get pulled — even in
+pages you pulled days ago. Clean pages are silently overwritten with the
+refreshed render; dirty pages get a `.md.remote` sibling for manual
+merge, same as ordinary re-pull.
 
 ## Marker syntax in the Markdown
 
@@ -118,19 +169,23 @@ These cause `push` to abort:
    ```
    confluence-markdown-roundtrip pull <page-id-or-url> [--subtree] [--into DIR]
    ```
+   For `--subtree` pulls, the CLI prints the path of the requested page's
+   directory on stdout — cd into it to start editing.
 2. **Edit** the resulting `index.md` (or several, in subtree mode).
 3. **Check** what changed:
    ```
-   confluence-markdown-roundtrip status <path>
-   diff <path>/index.md <path>/_meta/index.md.orig
+   confluence-markdown-roundtrip status <workspace-or-page-dir>
+   diff <page-dir>/index.md <page-dir>/_meta/index.md.orig
    ```
 4. **Push**:
    ```
-   confluence-markdown-roundtrip push <path>
+   confluence-markdown-roundtrip push <workspace-or-page-dir>
    ```
-   On conflict the push aborts and writes `<file>.md.remote` with the
-   server's current state. Inspect both, merge by hand, delete the
-   `.remote` file, and retry.
+   Pointing `push` at the workspace root (the `--into` directory) pushes
+   every dirty page leaf-first. Pointing it at a single page directory
+   pushes just that page. On conflict the push aborts and writes
+   `<file>.md.remote` with the server's current state. Inspect both,
+   merge by hand, delete the `.remote` file, and retry.
 
 ## Exit codes
 

@@ -64,11 +64,26 @@ def cli(ctx: click.Context, credentials_path: Path | None) -> None:
     "into_dir",
     type=click.Path(file_okay=False, path_type=Path),
     default=Path("."),
-    help="Parent directory; the page is written as <into>/<slug>/.",
+    help="Workspace directory. Single-page pulls land at <into>/<slug>/; "
+         "subtree/ancestor pulls treat <into> as the workspace root.",
 )
 @click.option("--subtree", is_flag=True, help="Pull the page + all descendants.")
+@click.option(
+    "--ancestors/--no-ancestors",
+    "with_ancestors",
+    default=None,
+    help="Include the ancestor chain to the space homepage. "
+         "Defaults to on with --subtree; off otherwise. "
+         "Use --no-ancestors with --subtree to skip the upward walk.",
+)
 @click.pass_context
-def pull(ctx: click.Context, page_arg: str, into_dir: Path, subtree: bool) -> None:
+def pull(
+    ctx: click.Context,
+    page_arg: str,
+    into_dir: Path,
+    subtree: bool,
+    with_ancestors: bool | None,
+) -> None:
     """Fetch a Confluence page and write `index.md` + `_meta/` to disk."""
     try:
         page_id = S.page_id_from_arg(page_arg)
@@ -76,17 +91,37 @@ def pull(ctx: click.Context, page_arg: str, into_dir: Path, subtree: bool) -> No
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
 
+    # Resolve the tristate `with_ancestors` flag.
+    if with_ancestors is None:
+        # No explicit flag: ancestors default on with --subtree, off without.
+        resolved_with_ancestors = bool(subtree)
+    else:
+        resolved_with_ancestors = with_ancestors
+
     creds = _load_creds(ctx)
     with ConfluenceClient(creds) as client:
-        if subtree:
+        # Subtree pull, or single-page pull with ancestors: both produce a
+        # workspace with a manifest at <into>/_meta/_subtree.json. The
+        # difference is whether descendants are also pulled.
+        if subtree or resolved_with_ancestors:
             try:
-                root_dir = pull_subtree(client, page_id, into_dir)
+                target_dir = pull_subtree(
+                    client,
+                    page_id,
+                    into_dir,
+                    with_ancestors=resolved_with_ancestors,
+                    with_descendants=subtree,
+                )
+            except S.PushAbort as e:
+                _emit_abort(e)
+                sys.exit(2)
             except APIError as e:
                 _emit_api_error(e)
                 sys.exit(4)
-            click.echo(str(root_dir))
+            click.echo(str(target_dir))
             return
 
+        # Plain single-page pull: legacy layout, no workspace-level manifest.
         try:
             page = client.get_page(page_id)
         except APIError as e:

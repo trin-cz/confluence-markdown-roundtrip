@@ -3,6 +3,14 @@
 The 4-page fixture tree (root + 2 children + 1 grandchild) is the live
 target. Each test starts by re-running bootstrap on every page (via the
 session fixture) and then exercises subtree operations.
+
+D-tests pass `--no-ancestors` to scope the workspace to the test area
+itself; Phase 8 ancestor behavior is covered by the AN-tests in
+`test_ancestors.py`. Without `--no-ancestors`, every D-test would pull
+the ancestors above the test-area root (including the space homepage
+and the read-only reference fixture) into the workspace, and a few
+mutate every page in the manifest — which would violate the CLAUDE.md
+"do not mutate the reference page" rule.
 """
 
 from __future__ import annotations
@@ -37,32 +45,40 @@ def test_D01_subtree_pull(baselines, tmp_path, restore):
     for logical in ("root", "child_a", "child_b", "grandchild"):
         restore(logical)
     root_id = baselines["root"]["page_id"]
-    out = _run("pull", root_id, "--subtree", "--into", str(tmp_path))
+    out = _run("pull", root_id, "--subtree", "--no-ancestors", "--into", str(tmp_path))
     assert out.returncode == 0, out.stderr
 
-    root_dir = Path(out.stdout.strip().splitlines()[-1])
-    manifest_path = root_dir / "_meta" / "_subtree.json"
-    assert manifest_path.exists()
+    # Manifest now lives at workspace root (--into level), not inside a page dir.
+    manifest_path = tmp_path / "_meta" / "_subtree.json"
+    assert manifest_path.exists(), f"missing workspace manifest at {manifest_path}"
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    assert data["root_page_id"] == root_id
+    assert data["root_page_ids"] == [root_id]
     assert len(data["pages"]) == 4
 
     by_pid = {p["page_id"]: p for p in data["pages"]}
-    # Root entry
-    assert by_pid[root_id]["path"] == "index.md"
-    assert by_pid[root_id]["parent_id"] is None
+    # Root entry — path is now relative to <into>, so includes the topmost slug.
+    root_entry = by_pid[root_id]
+    assert root_entry["path"].endswith("/index.md")
+    assert root_entry["path"].count("/") == 1, root_entry["path"]
+    assert root_entry["parent_id"] is None
+    topmost_slug = root_entry["path"][: -len("/index.md")]
 
-    # Grandchild's path is nested two levels deep
+    # Grandchild's path is nested two levels under the topmost slug
     grandchild_id = baselines["grandchild"]["page_id"]
     grandchild_entry = by_pid[grandchild_id]
-    assert grandchild_entry["path"].count("/") == 2
+    assert grandchild_entry["path"].startswith(f"{topmost_slug}/")
+    assert grandchild_entry["path"].count("/") == 3, grandchild_entry["path"]
     assert grandchild_entry["path"].endswith("/index.md")
     assert grandchild_entry["parent_id"] == baselines["child_a"]["page_id"]
 
     # On-disk layout: each page entry's path points at a real index.md
     for entry in data["pages"]:
-        assert (root_dir / entry["path"]).exists(), f"missing {entry['path']}"
+        assert (tmp_path / entry["path"]).exists(), f"missing {entry['path']}"
+
+    # CLI's stdout should print the requested page's directory.
+    target_dir = Path(out.stdout.strip().splitlines()[-1])
+    assert target_dir == tmp_path / topmost_slug
 
 
 # ---------------------------------------------------------------------------
@@ -74,20 +90,22 @@ def test_D03_subtree_leaf_first_push(baselines, tmp_path, restore, live_client):
     for logical in ("root", "child_a", "child_b", "grandchild"):
         restore(logical)
     root_id = baselines["root"]["page_id"]
-    out = _run("pull", root_id, "--subtree", "--into", str(tmp_path))
+    out = _run("pull", root_id, "--subtree", "--no-ancestors", "--into", str(tmp_path))
     assert out.returncode == 0, out.stderr
-    root_dir = Path(out.stdout.strip().splitlines()[-1])
+
+    # Workspace root is --into. Push operates on the workspace.
+    manifest_path = tmp_path / "_meta" / "_subtree.json"
+    manifest = json.loads(manifest_path.read_text())
 
     # Mutate every page so each is dirty.
-    manifest = json.loads((root_dir / "_meta" / "_subtree.json").read_text())
     for entry in manifest["pages"]:
-        index_md = root_dir / entry["path"]
+        index_md = tmp_path / entry["path"]
         index_md.write_text(
             index_md.read_text(encoding="utf-8") + "\n\nD03 mutated.\n",
             encoding="utf-8",
         )
 
-    push = _run("push", str(root_dir))
+    push = _run("push", str(tmp_path))
     assert push.returncode == 0, push.stderr
 
     # The CLI prints one "pushed -> version N" line per page in push order.
@@ -98,7 +116,7 @@ def test_D03_subtree_leaf_first_push(baselines, tmp_path, restore, live_client):
     # Find the index of each logical page in the push order.
     by_pid_path: dict[str, str] = {}
     for entry in manifest["pages"]:
-        by_pid_path[entry["page_id"]] = str(root_dir / Path(entry["path"]).parent)
+        by_pid_path[entry["page_id"]] = str(tmp_path / Path(entry["path"]).parent)
 
     def order_index(pid: str) -> int:
         target = by_pid_path[pid]
@@ -127,23 +145,22 @@ def test_D04_subtree_repull_partial_dirty(baselines, tmp_path, restore, live_cli
     for logical in ("root", "child_a", "child_b", "grandchild"):
         restore(logical)
     root_id = baselines["root"]["page_id"]
-    out = _run("pull", root_id, "--subtree", "--into", str(tmp_path))
+    out = _run("pull", root_id, "--subtree", "--no-ancestors", "--into", str(tmp_path))
     assert out.returncode == 0, out.stderr
-    root_dir = Path(out.stdout.strip().splitlines()[-1])
 
-    # Dirty up root + child_a only.
-    manifest = json.loads((root_dir / "_meta" / "_subtree.json").read_text())
+    # Manifest at workspace root (--into level).
+    manifest = json.loads((tmp_path / "_meta" / "_subtree.json").read_text())
     by_pid = {p["page_id"]: p for p in manifest["pages"]}
-    root_index = root_dir / by_pid[baselines["root"]["page_id"]]["path"]
-    child_a_index = root_dir / by_pid[baselines["child_a"]["page_id"]]["path"]
-    child_b_index = root_dir / by_pid[baselines["child_b"]["page_id"]]["path"]
-    grandchild_index = root_dir / by_pid[baselines["grandchild"]["page_id"]]["path"]
+    root_index = tmp_path / by_pid[baselines["root"]["page_id"]]["path"]
+    child_a_index = tmp_path / by_pid[baselines["child_a"]["page_id"]]["path"]
+    child_b_index = tmp_path / by_pid[baselines["child_b"]["page_id"]]["path"]
+    grandchild_index = tmp_path / by_pid[baselines["grandchild"]["page_id"]]["path"]
 
     root_index.write_text(root_index.read_text(encoding="utf-8") + "\n\nD04 root edit.\n", encoding="utf-8")
     child_a_index.write_text(child_a_index.read_text(encoding="utf-8") + "\n\nD04 child_a edit.\n", encoding="utf-8")
 
     # Re-pull into the same directory.
-    out2 = _run("pull", root_id, "--subtree", "--into", str(tmp_path))
+    out2 = _run("pull", root_id, "--subtree", "--no-ancestors", "--into", str(tmp_path))
     assert out2.returncode == 0, out2.stderr
 
     # Dirty pages get .remote.md siblings; clean pages overwrite in place.

@@ -4,3 +4,4 @@ uv.lock
 *.egg-info/
 live-tests.toml
 credentials.toml
+raw/
